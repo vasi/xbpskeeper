@@ -1,0 +1,182 @@
+#!/usr/bin/env ruby
+require 'etc'
+require 'fileutils'
+require 'pathname'
+require 'set'
+require 'tmpdir'
+
+# Declarative package management with xbps!
+
+class XbpsKeeper
+  HOME = Dir.home(ENV['SUDO_USER'] || Etc.getlogin)
+  CONFDIR = Pathname.new(HOME).join('.config', 'xbpskeeper')
+  XBPS_DB = Pathname.new('/var/db/xbps')
+
+  attr_reader :keepers
+
+  def read_package_list(path)
+    return Set.new unless path.file?
+    path.readlines
+      .map { |l| l.sub(/#.*$/, '').strip }
+      .flat_map { |l| l.split(/\s+/) }
+      .reject(&:empty?)
+      .to_set
+  end
+
+  def load_installed
+    @manual = IO.popen(['xbps-query', '-m']).readlines
+      .map { |l| l.split.first.sub(/-[0-9].*/, '') }
+      .to_set
+    @all = IO.popen(['xbps-query', '-l']).readlines
+      .select { |l| l.start_with?('ii ') }
+      .map { |l| l.split[1].sub(/-[0-9].*/, '') }
+      .to_set
+  end
+
+  def initialize
+    CONFDIR.mkpath
+    load_installed
+    @keepers = CONFDIR.children
+      .select { |p| p.file? && p.extname == '.keep' }
+      .reduce(Set.new) { |ks, p| ks.merge(read_package_list(p)) }
+  end
+
+  def auto
+    @all - @manual
+  end
+
+  def manual
+    @manual
+  end
+
+  def installed
+    @all
+  end
+
+  def print(pkgs, header = nil)
+    puts header if header
+    prefix = header ? "  " : ""
+    pkgs.sort.each { |p| puts "#{prefix}#{p}" }
+  end
+
+  def create_state
+    Dir.mktmpdir do |tmp|
+      state = Pathname.new(tmp)
+      state_xbps = state.join('var', 'db', 'xbps')
+      FileUtils.mkdir_p(state_xbps.parent)
+      FileUtils.cp_r(XBPS_DB.to_s, state_xbps.to_s)
+
+      candidates.each  { |pkg| system('xbps-pkgdb', '-r', state.to_s, '-m', 'auto',   pkg) }
+      (auto & keepers).each { |pkg| system('xbps-pkgdb', '-r', state.to_s, '-m', 'manual', pkg) }
+
+      yield state
+    end
+  end
+
+  def simulate_autoremove
+    remove = Set.new
+    create_state do |state|
+      IO.popen(['xbps-remove', '-r', state.to_s, '-no']).readlines.each do |line|
+        md = /^(\S+)\s+remove\b/.match(line) or next
+        remove << md[1]
+      end
+    end
+    remove
+  end
+
+  def missing
+    @keepers - installed
+  end
+
+  def candidates
+    manual - @keepers
+  end
+
+  def unneeded
+    @unneeded ||= simulate_autoremove
+  end
+
+  def write_root_keepers
+    new_manual = auto & keepers
+    new_auto = manual - keepers
+    new_manual.each { |pkg| system('xbps-pkgdb', '-m', 'manual', pkg) }
+    new_auto.each { |pkg| system('xbps-pkgdb', '-m', 'auto', pkg) }
+  end
+
+  def add_keepers(basename, reason, packages)
+    basename = File.basename(basename, '.keep')
+    comment = reason.empty? ? "" : " # #{reason}"
+    CONFDIR.join(basename + '.keep').open('a') do |f|
+      f.puts "#{packages.join(" ")}#{comment}"
+    end
+  end
+end
+
+ak = XbpsKeeper.new
+orig_argv = ARGV.dup
+FORCE_RERUN = ['force']
+rerun_root = ->(list, &block) do
+  if list.empty?
+    $stderr.puts "Nothing to do"
+    return
+  end
+  if Process.uid == 0
+    ak.write_root_keepers
+    block[list.sort]
+  else
+    exec('sudo', __FILE__, *orig_argv)
+  end
+end
+
+arg = ARGV.shift
+case arg
+when 'keepers'
+  ak.print(ak.keepers)
+when 'missing'
+  ak.print(ak.missing)
+when 'unneeded'
+  ak.print(ak.unneeded)
+when 'candidates'
+  ak.print(ak.candidates)
+when 'diff'
+  puts "Nothing to do" unless ak.missing.any? || ak.unneeded.any?
+  ak.print(ak.missing, "To install:") if ak.missing.any?
+  ak.print(ak.unneeded, "To remove:") if ak.unneeded.any?
+when 'install'
+  rerun_root[ak.missing] { |ps| exec('xbps-install', '-S', *ps) }
+when 'remove'
+  rerun_root[ak.unneeded] { exec('xbps-remove', '-o') }
+when 'sync'
+  rerun_root[ak.missing + ak.unneeded] do
+    system('xbps-install', '-S', *ak.missing.sort) if ak.missing.any?
+    exec('xbps-remove', '-o') if ak.unneeded.any?
+  end
+when 'update-reasons'
+  rerun_root[FORCE_RERUN] { }
+when 'add'
+  basename, reason, *adding = ARGV
+  if adding.empty?
+    $stderr.puts "Usage: xbpskeeper add BASENAME REASON PACKAGE [PACKAGE...]"
+    exit 2
+  end
+  ak.add_keepers(basename, reason, adding) unless Process.uid == 0
+  rerun_root[adding] do |ps|
+    exec('xbps-install', '-S', *ps)
+  end
+else
+  $stderr.puts <<~EOD
+    Usage: xbpskeeper [command]
+    Commands:
+      keepers    - list packages in .keep files
+      missing    - list packages that need installing to match .keep files
+      unneeded   - list packages that need removal to match .keep files
+      candidates - list top-level packages that need removal
+      diff       - list packages that need installing or removal
+      install    - install missing packages
+      remove     - remove unneeded packages
+      sync       - install missing and remove unneeded packages
+      update-reasons - update xbps reason database
+      add FILE REASON PACKAGE ... - add packages to keepers, and install them
+    EOD
+  exit 2
+end
